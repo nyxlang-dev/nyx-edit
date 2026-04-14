@@ -1,0 +1,7 @@
+[package]
+name = "nyx-edit"
+version = "0.1.0"
+main = "src/main.nx"
+description = "Terminal text editor built in Nyx"
+
+[dependencies]
