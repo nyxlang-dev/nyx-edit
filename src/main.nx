@@ -1,0 +1,1641 @@
+// nyx-edit — Terminal text editor in Nyx
+// Uses all new builtins: raw_mode_enter/exit, chr, read_byte, term_cols/rows,
+//   arr.insert, arr.remove, short-circuit and/or, arr[i].method(), bare return, defer
+//
+// Usage:
+//   make run FILE=examples/nyx-edit.nx                   (empty buffer)
+//   make run FILE=examples/nyx-edit.nx ARGS=file.txt     (open file)
+//
+// Keys:
+//   Arrows        move cursor
+//   Shift+Arrows  select text
+//   Ctrl+S        save
+//   Ctrl+Q        quit
+//   Ctrl+K        delete line
+//   Ctrl+Z        undo
+//   Ctrl+Y        redo
+//   Ctrl+F        search
+//   Ctrl+G        goto line
+//   Ctrl+C        copy selection
+//   Ctrl+X        cut selection
+//   Ctrl+V        paste
+//   Enter         new line
+//   Backspace     delete char back
+//   Del           delete char forward
+//   Home/End      start/end of line
+//   PgUp/PgDn     page up/down
+//   Tab           insert 4 spaces
+
+// Key constants
+const KEY_UP    = 1000
+const KEY_DOWN  = 1001
+const KEY_LEFT  = 1002
+const KEY_RIGHT = 1003
+const KEY_DEL   = 1004
+const KEY_HOME  = 1005
+const KEY_END   = 1006
+const KEY_PGUP  = 1007
+const KEY_PGDN  = 1008
+const KEY_SHIFT_UP    = 1010
+const KEY_SHIFT_DOWN  = 1011
+const KEY_SHIFT_LEFT  = 1012
+const KEY_SHIFT_RIGHT = 1013
+// Sentinel: read_key despertó sin tecla (señal o timeout) — el main loop
+// aprovecha para aplicar resize pendiente y re-renderizar.
+const KEY_NONE = 999
+// Sentinel: read_key armó un codepoint UTF-8 multibyte en g_utf8_buf
+const KEY_UTF8 = 998
+// Sentinel: read_key capturó un bracketed paste completo en g_paste_buf
+const KEY_PASTE = 997
+// Sentinel: read_key parseó un evento de mouse SGR en g_mouse_*
+const KEY_MOUSE = 996
+
+const CTRL_C = 3
+const CTRL_F = 6
+const CTRL_G = 7
+const CTRL_K = 11
+const CTRL_Q = 17
+const CTRL_S = 19
+const CTRL_V = 22
+const CTRL_X = 24
+const CTRL_Y = 25
+const CTRL_Z = 26
+
+const PREFIX_W = 7
+const TAB_WIDTH = 4
+
+// Editor state
+var g_lines:    Array  = [""]
+var g_cx:       int    = 0
+var g_cy:       int    = 0
+var g_top:      int    = 0
+var g_left:     int    = 0
+var g_filename: String = "unnamed.txt"
+var g_modified: bool   = false
+var g_running:  bool   = true
+var g_cols:     int    = 80
+var g_rows:     int    = 22
+var g_message:  String = "Ctrl+S save  Ctrl+Q quit  Ctrl+F search  Ctrl+Z undo  Ctrl+Y redo"
+
+// Selection state
+var g_sel_active: bool = false
+var g_sel_sx:     int  = 0
+var g_sel_sy:     int  = 0
+
+// Clipboard
+var g_clipboard: String = ""
+
+// Undo/redo incremental: cada operación registra un delta
+//   [y, old_count, old_text, new_count, new_text, cx_b, cy_b, cx_a, cy_a, group]
+// = las líneas [y, y+old_count) contenían old_text (join "\n") y ahora
+// [y, y+new_count) contienen new_text. Undo y redo son splices simétricos.
+// Los inserts contiguos de tipeo comparten group (1 undo = palabra entera).
+var g_undo:      Array  = []
+var g_redo:      Array  = []
+var g_undo_max:  int    = 1000
+var g_group_next: int   = 0
+var g_last_edit_y: int  = -1
+var g_last_edit_x: int  = -1
+
+// Search state
+var g_search_term: String = ""
+
+// Frame buffer del render: mientras g_buffering, todo out() se acumula en
+// g_frame y se emite como UN solo term_write por frame (sin parpadeo).
+var g_frame: Array = []
+var g_buffering: bool = false
+
+// Seteado por el handler de SIGWINCH. El handler corre DENTRO del contexto
+// de señal (trampoline del runtime) — solo puede hacer este store; cualquier
+// alocación GC ahí es async-signal-unsafe. El main loop consume el flag.
+var g_resize_pending: bool = false
+
+// Codepoint multibyte pendiente armado por read_key (ver KEY_UTF8)
+var g_utf8_buf: String = ""
+
+// Contenido del bracketed paste capturado por read_key (ver KEY_PASTE)
+var g_paste_buf: String = ""
+
+// Último evento de mouse SGR (ver KEY_MOUSE): botón, coords 1-based, press
+var g_mouse_b: int = 0
+var g_mouse_x: int = 0
+var g_mouse_y: int = 0
+var g_mouse_press: bool = false
+
+// Nyx keywords for syntax highlighting
+var g_keywords: Array = ["fn", "let", "var", "if", "else", "while", "for", "in", "return", "struct", "enum", "impl", "trait", "match", "const", "import", "export", "extern", "defer", "spawn", "select", "async", "await", "true", "false", "not", "and", "or", "type", "pub", "break", "continue"]
+
+// Terminal helpers
+
+// Toda la salida del editor pasa por acá: bufferizada durante render(),
+// inmediata (print + flush) fuera de él (prompts, mensajes).
+fn out(s: String) {
+    if g_buffering {
+        g_frame.push(s)
+    } else {
+        print_no_newline(s)
+    }
+}
+
+fn frame_flush() {
+    let sb: StringBuilder = StringBuilder.new(16384)
+    var i = 0
+    while i < g_frame.length() {
+        let chunk: String = g_frame[i]
+        sb.append(chunk)
+        i = i + 1
+    }
+    term_write(sb.to_string())
+    term_flush()
+    g_frame = []
+}
+
+fn esc(seq: String) {
+    out(chr(27) + seq)
+}
+
+fn clear_screen() {
+    esc("[2J")
+    esc("[H")
+}
+
+fn move_to(row: int, col: int) {
+    esc("[" + int_to_string(row + 1) + ";" + int_to_string(col + 1) + "H")
+}
+
+fn hide_cursor() { esc("[?25l") }
+fn show_cursor() { esc("[?25h") }
+// Alternate screen: la edición ocurre en una pantalla aparte y al salir se
+// restaura la terminal tal como estaba (scrollback intacto, como vim/less).
+// Emitir ?1049l sin estar en alt screen es inofensivo (idempotente).
+fn enter_alt_screen() { esc("[?1049h") }
+fn leave_alt_screen() { esc("[?1049l") }
+// Bracketed paste: el terminal envuelve lo pegado en ESC[200~..ESC[201~
+// para que no se interprete como teclas sueltas
+fn paste_mode_on()  { esc("[?2004h") }
+fn paste_mode_off() { esc("[?2004l") }
+// Mouse: ?1002 = clicks + drag; ?1006 = encoding SGR (coords sin límite 223).
+// CRÍTICO apagarlo en todos los paths de salida: mouse activo tras salir
+// arruina la terminal del usuario (el destructor C solo restaura termios).
+fn mouse_mode_on()  { esc("[?1002h") ; esc("[?1006h") }
+fn mouse_mode_off() { esc("[?1006l") ; esc("[?1002l") }
+fn dim_on()      { esc("[2m")  }
+fn rev_on()      { esc("[7m")  }
+fn bold_on()     { esc("[1m")  }
+fn attr_off()    { esc("[0m")  }
+fn erase_eol()   { esc("[K")   }
+
+fn fg_color(r: int, g: int, b: int) {
+    esc("[38;2;" + int_to_string(r) + ";" + int_to_string(g) + ";" + int_to_string(b) + "m")
+}
+
+fn bg_color(r: int, g: int, b: int) {
+    esc("[48;2;" + int_to_string(r) + ";" + int_to_string(g) + ";" + int_to_string(b) + "m")
+}
+
+// Utility
+
+fn line_num_str(n: int) -> String {
+    let s = int_to_string(n)
+    let len = s.length()
+    if len == 1 { return "   " + s }
+    if len == 2 { return "  " + s }
+    if len == 3 { return " " + s }
+    return s
+}
+
+fn pad_right(s: String, target: int) -> String {
+    var result = s
+    while result.length() < target {
+        result = result + " "
+    }
+    if result.length() > target {
+        result = result.substring(0, target)
+    }
+    return result
+}
+
+// UTF-8: la unidad interna sigue siendo el BYTE (contrato strings=bytes
+// v0.14); estos helpers navegan por codepoints. Ancho visual asumido: 1
+// (wide chars CJK/emoji = etapa 2).
+
+// Largo en bytes del codepoint según su byte líder
+fn utf8_len(lead: int) -> int {
+    if lead < 128 { return 1 }
+    if lead >= 240 { return 4 }
+    if lead >= 224 { return 3 }
+    if lead >= 192 { return 2 }
+    return 1
+}
+
+fn is_utf8_cont(b: int) -> bool {
+    return b >= 128 and b < 192
+}
+
+// Índice de byte del codepoint siguiente
+fn utf8_next(line: String, i: int) -> int {
+    let len = line.length()
+    if i >= len { return len }
+    var n = i + utf8_len(line.charAt(i))
+    if n > len { n = len }
+    return n
+}
+
+// Índice de byte del codepoint anterior
+fn utf8_prev(line: String, i: int) -> int {
+    var p = i - 1
+    while p > 0 and is_utf8_cont(line.charAt(p)) {
+        p = p - 1
+    }
+    if p < 0 { return 0 }
+    return p
+}
+
+// Inverso de col_of: índice de byte para una columna visual
+fn byte_of_col(line: String, col: int) -> int {
+    var i = 0
+    var c = 0
+    while c < col and i < line.length() {
+        i = utf8_next(line, i)
+        c = c + 1
+    }
+    return i
+}
+
+// Columna visual (codepoints) para un índice de byte
+fn col_of(line: String, byte_idx: int) -> int {
+    var col = 0
+    var i = 0
+    while i < byte_idx and i < line.length() {
+        i = utf8_next(line, i)
+        col = col + 1
+    }
+    return col
+}
+
+// Emite el "carácter" en el byte i (ASCII imprimible, codepoint multibyte
+// entero, o espacio para controles) y devuelve el índice del siguiente
+fn emit_char_at(line: String, i: int) -> int {
+    let ch = line.charAt(i)
+    if ch >= 32 and ch <= 126 {
+        out(chr(ch))
+        return i + 1
+    }
+    if ch >= 128 {
+        let n = utf8_next(line, i)
+        out(line.substring(i, n))
+        return n
+    }
+    out(" ")
+    return i + 1
+}
+
+fn min(a: int, b: int) -> int {
+    if a < b { return a }
+    return b
+}
+
+fn max(a: int, b: int) -> int {
+    if a > b { return a }
+    return b
+}
+
+// Input
+
+fn read_key() -> int {
+    // poll() sin timeout: despierta ante SIGWINCH (-2) aunque no haya tecla.
+    let c = read_byte_timeout(0 - 1)
+    if c == -2 { return KEY_NONE }
+    if c == -1 { return -1 }
+
+    if c == 27 {
+        // Continuaciones con timeout corto: si no llega nada, era ESC solo
+        // (antes era imposible distinguir ESC de una secuencia).
+        let c2 = read_byte_timeout(50)
+        if c2 < 0 { return 27 }
+        if c2 == 91 {
+            let c3 = read_byte_timeout(50)
+            if c3 == 65 { return KEY_UP }
+            if c3 == 66 { return KEY_DOWN }
+            if c3 == 67 { return KEY_RIGHT }
+            if c3 == 68 { return KEY_LEFT }
+            if c3 == 72 { return KEY_HOME }
+            if c3 == 70 { return KEY_END }
+            // ESC [ 1 ; 2 X  (shift+arrow)
+            if c3 == 49 {
+                let c4 = read_byte_timeout(50)
+                if c4 == 59 {
+                    let c5 = read_byte_timeout(50)
+                    if c5 == 50 {
+                        let c6 = read_byte_timeout(50)
+                        if c6 == 65 { return KEY_SHIFT_UP }
+                        if c6 == 66 { return KEY_SHIFT_DOWN }
+                        if c6 == 67 { return KEY_SHIFT_RIGHT }
+                        if c6 == 68 { return KEY_SHIFT_LEFT }
+                    }
+                }
+                if c4 == 126 { return KEY_HOME }
+                return 27
+            }
+            // ESC [ < b ; x ; y (M|m) — evento de mouse SGR
+            if c3 == 60 {
+                var mb = 0
+                var mx = 0
+                var my = 0
+                var cur = read_byte_timeout(50)
+                while cur >= 48 and cur <= 57 {
+                    mb = mb * 10 + (cur - 48)
+                    cur = read_byte_timeout(50)
+                }
+                if cur != 59 { return KEY_NONE }
+                cur = read_byte_timeout(50)
+                while cur >= 48 and cur <= 57 {
+                    mx = mx * 10 + (cur - 48)
+                    cur = read_byte_timeout(50)
+                }
+                if cur != 59 { return KEY_NONE }
+                cur = read_byte_timeout(50)
+                while cur >= 48 and cur <= 57 {
+                    my = my * 10 + (cur - 48)
+                    cur = read_byte_timeout(50)
+                }
+                if cur == 77 or cur == 109 {
+                    g_mouse_b = mb
+                    g_mouse_x = mx
+                    g_mouse_y = my
+                    g_mouse_press = cur == 77
+                    return KEY_MOUSE
+                }
+                return KEY_NONE
+            }
+            // ESC [ 2 0 0 ~  — inicio de bracketed paste
+            if c3 == 50 {
+                let c4 = read_byte_timeout(50)
+                if c4 == 48 {
+                    let c5 = read_byte_timeout(50)
+                    if c5 == 48 {
+                        let c6 = read_byte_timeout(50)
+                        if c6 == 126 {
+                            read_paste_body()
+                            return KEY_PASTE
+                        }
+                    }
+                }
+                return 27
+            }
+            if c3 == 51 { read_byte_timeout(50) ; return KEY_DEL }
+            if c3 == 52 { read_byte_timeout(50) ; return KEY_END }
+            if c3 == 53 { read_byte_timeout(50) ; return KEY_PGUP }
+            if c3 == 54 { read_byte_timeout(50) ; return KEY_PGDN }
+        }
+        return 27
+    }
+    // Byte líder UTF-8: armar el codepoint completo con sus continuaciones
+    if c >= 194 and c <= 244 {
+        var s = chr(c)
+        var need = utf8_len(c) - 1
+        while need > 0 {
+            let cb = read_byte_timeout(50)
+            if cb < 0 or not is_utf8_cont(cb) {
+                // secuencia truncada/inválida: descartar
+                return KEY_NONE
+            }
+            s = s + chr(cb)
+            need = need - 1
+        }
+        g_utf8_buf = s
+        return KEY_UTF8
+    }
+    return c
+}
+
+// Acumula el cuerpo del paste hasta ESC[201~ (o timeout de seguridad)
+fn read_paste_body() {
+    let sb: StringBuilder = StringBuilder.new(1024)
+    var done = false
+    while not done {
+        let b = read_byte_timeout(500)
+        if b < 0 {
+            // terminador perdido: cortar acá en vez de colgar el editor
+            done = true
+        } else if b == 27 {
+            let b2 = read_byte_timeout(50)
+            let b3 = read_byte_timeout(50)
+            let b4 = read_byte_timeout(50)
+            let b5 = read_byte_timeout(50)
+            if b2 == 91 and b3 == 50 and b4 == 48 and b5 == 49 {
+                read_byte_timeout(50)
+                done = true
+            } else {
+                // ESC crudo dentro del paste: conservarlo como texto
+                sb.append(chr(27))
+                if b2 >= 0 { sb.append(chr(b2)) }
+                if b3 >= 0 { sb.append(chr(b3)) }
+                if b4 >= 0 { sb.append(chr(b4)) }
+                if b5 >= 0 { sb.append(chr(b5)) }
+            }
+        } else {
+            sb.append(chr(b))
+        }
+    }
+    g_paste_buf = sb.to_string()
+}
+
+// File I/O
+
+fn load_file(filename: String) -> Array {
+    if not file_exists(filename) {
+        return [""]
+    }
+    let f: File = file_open(filename, "r")
+    var lines: Array = []
+    var done = false
+    while not done {
+        let line = file_read_line(f)
+        if line == ":EOF:" {
+            done = true
+        } else {
+            lines.push(line)
+        }
+    }
+    file_close(f)
+    if lines.length() == 0 {
+        lines.push("")
+    }
+    return lines
+}
+
+fn save_file() {
+    let f: File = file_open(g_filename, "w")
+    var i = 0
+    while i < g_lines.length() {
+        let line: String = g_lines[i]
+        file_write_string(f, line + "\n")
+        i = i + 1
+    }
+    file_close(f)
+    g_modified = false
+    g_message = "Saved: " + g_filename + " (" + int_to_string(g_lines.length()) + " lines)"
+}
+
+// Undo/redo incremental
+
+fn lines_text(y: int, count: int) -> String {
+    var t = ""
+    var i = 0
+    while i < count {
+        if i > 0 { t = t + "\n" }
+        let l: String = g_lines[y + i]
+        t = t + l
+        i = i + 1
+    }
+    return t
+}
+
+// Reemplaza `count` líneas en y por las `ins_count` líneas de `text`
+fn splice_lines(y: int, count: int, text: String, ins_count: int) {
+    var i = 0
+    while i < count {
+        g_lines.remove(y)
+        i = i + 1
+    }
+    if ins_count > 0 {
+        let parts = text.split("\n")
+        var j = 0
+        while j < ins_count {
+            let p: String = parts[j]
+            g_lines.insert(y + j, p)
+            j = j + 1
+        }
+    }
+    if g_lines.length() == 0 {
+        g_lines.push("")
+    }
+}
+
+// Grupo nuevo (operación no coalescible)
+fn new_group() -> int {
+    g_group_next = g_group_next + 1
+    g_last_edit_y = -1
+    g_last_edit_x = -1
+    return g_group_next
+}
+
+// Grupo de tipeo: continúa si el insert es contiguo al anterior
+fn typing_group() -> int {
+    if g_last_edit_y == g_cy and g_last_edit_x == g_cx and g_undo.length() > 0 {
+        return g_group_next
+    }
+    g_group_next = g_group_next + 1
+    return g_group_next
+}
+
+// Captura el estado ANTES de mutar (old_text y cursor); completar con op_commit
+fn op_begin(y: int, old_count: int, group: int) -> Array {
+    let rec = [y, old_count, lines_text(y, old_count), 0, "", g_cx, g_cy, 0, 0, group]
+    return rec
+}
+
+fn op_commit(rec: Array, new_count: int, new_text: String) {
+    rec[3] = new_count
+    rec[4] = new_text
+    rec[7] = g_cx
+    rec[8] = g_cy
+    g_undo.push(rec)
+    if g_undo.length() > g_undo_max {
+        g_undo.shift()
+    }
+    // Toda edición nueva invalida el redo
+    g_redo = []
+}
+
+fn undo_apply(rec: Array) {
+    let y: int = rec[0]
+    let old_count: int = rec[1]
+    let old_text: String = rec[2]
+    let new_count: int = rec[3]
+    splice_lines(y, new_count, old_text, old_count)
+    g_cx = rec[5]
+    g_cy = rec[6]
+}
+
+fn redo_apply(rec: Array) {
+    let y: int = rec[0]
+    let old_count: int = rec[1]
+    let new_count: int = rec[3]
+    let new_text: String = rec[4]
+    splice_lines(y, old_count, new_text, new_count)
+    g_cx = rec[7]
+    g_cy = rec[8]
+}
+
+fn do_undo() {
+    if g_undo.length() == 0 {
+        g_message = "Nothing to undo"
+        return
+    }
+    let last: Array = g_undo[g_undo.length() - 1]
+    let grp: int = last[9]
+    var done = false
+    while not done {
+        if g_undo.length() == 0 {
+            done = true
+        } else {
+            let rec: Array = g_undo[g_undo.length() - 1]
+            let rgrp: int = rec[9]
+            if rgrp != grp {
+                done = true
+            } else {
+                g_undo.pop()
+                undo_apply(rec)
+                g_redo.push(rec)
+            }
+        }
+    }
+    g_last_edit_y = -1
+    g_last_edit_x = -1
+    sel_clear()
+    clamp_col()
+    adjust_scroll()
+    g_modified = true
+    g_message = "Undo"
+}
+
+fn do_redo() {
+    if g_redo.length() == 0 {
+        g_message = "Nothing to redo"
+        return
+    }
+    let last: Array = g_redo[g_redo.length() - 1]
+    let grp: int = last[9]
+    var done = false
+    while not done {
+        if g_redo.length() == 0 {
+            done = true
+        } else {
+            let rec: Array = g_redo[g_redo.length() - 1]
+            let rgrp: int = rec[9]
+            if rgrp != grp {
+                done = true
+            } else {
+                g_redo.pop()
+                redo_apply(rec)
+                g_undo.push(rec)
+            }
+        }
+    }
+    g_last_edit_y = -1
+    g_last_edit_x = -1
+    sel_clear()
+    clamp_col()
+    adjust_scroll()
+    g_modified = true
+    g_message = "Redo"
+}
+
+// Selection helpers
+
+fn sel_clear() {
+    g_sel_active = false
+}
+
+fn sel_start_at(x: int, y: int) {
+    if not g_sel_active {
+        g_sel_active = true
+        g_sel_sx = x
+        g_sel_sy = y
+    }
+}
+
+fn sel_ordered() -> Array {
+    // Returns [sx, sy, ex, ey] in document order
+    var sy = g_sel_sy
+    var sx = g_sel_sx
+    var ey = g_cy
+    var ex = g_cx
+    if sy > ey or (sy == ey and sx > ex) {
+        let tmp_y = sy
+        let tmp_x = sx
+        sy = ey
+        sx = ex
+        ey = tmp_y
+        ex = tmp_x
+    }
+    return [sx, sy, ex, ey]
+}
+
+fn sel_get_text() -> String {
+    if not g_sel_active { return "" }
+    let coords = sel_ordered()
+    let sx: int = coords[0]
+    let sy: int = coords[1]
+    let ex: int = coords[2]
+    let ey: int = coords[3]
+
+    if sy == ey {
+        let line: String = g_lines[sy]
+        return line.substring(sx, ex)
+    }
+
+    var text = ""
+    let first_line: String = g_lines[sy]
+    text = first_line.substring(sx, first_line.length())
+    var i = sy + 1
+    while i < ey {
+        let mid_line: String = g_lines[i]
+        text = text + "\n" + mid_line
+        i = i + 1
+    }
+    let last_line: String = g_lines[ey]
+    text = text + "\n" + last_line.substring(0, ex)
+    return text
+}
+
+fn delete_selection() {
+    if not g_sel_active { return }
+    let coords = sel_ordered()
+    let sx: int = coords[0]
+    let sy: int = coords[1]
+    let ex: int = coords[2]
+    let ey: int = coords[3]
+
+    let rec = op_begin(sy, ey - sy + 1, new_group())
+
+    if sy == ey {
+        let line: String = g_lines[sy]
+        g_lines[sy] = line.substring(0, sx) + line.substring(ex, line.length())
+        g_cx = sx
+        g_cy = sy
+    } else {
+        let first_line: String = g_lines[sy]
+        let last_line: String = g_lines[ey]
+        g_lines[sy] = first_line.substring(0, sx) + last_line.substring(ex, last_line.length())
+        // Remove lines sy+1 through ey
+        var i = ey
+        while i > sy {
+            g_lines.remove(i)
+            i = i - 1
+        }
+        g_cx = sx
+        g_cy = sy
+    }
+
+    sel_clear()
+    g_modified = true
+    op_commit(rec, 1, lines_text(sy, 1))
+}
+
+// Clipboard operations
+
+fn do_copy() {
+    if not g_sel_active { return }
+    g_clipboard = sel_get_text()
+    g_message = "Copied"
+}
+
+fn do_cut() {
+    if not g_sel_active { return }
+    g_clipboard = sel_get_text()
+    delete_selection()
+    g_message = "Cut"
+}
+
+fn do_paste() {
+    if g_clipboard == "" { return }
+    do_paste_text(g_clipboard)
+}
+
+// Inserta texto arbitrario (posiblemente multilínea) como UNA operación de
+// undo. Normaliza \r\n y \r a \n (los terminales mandan \r en los pastes).
+fn do_paste_text(text: String) {
+    if text == "" { return }
+    if g_sel_active {
+        delete_selection()
+    }
+    let nsb: StringBuilder = StringBuilder.new(text.length() + 16)
+    var ti = 0
+    while ti < text.length() {
+        let tb = text.charAt(ti)
+        if tb == 13 {
+            nsb.append("\n")
+            if ti + 1 < text.length() and text.charAt(ti + 1) == 10 {
+                ti = ti + 1
+            }
+        } else {
+            nsb.append(chr(tb))
+        }
+        ti = ti + 1
+    }
+    let normalized: String = nsb.to_string()
+    let parts = normalized.split("\n")
+    let y0 = g_cy
+    let rec = op_begin(y0, 1, new_group())
+    if parts.length() == 1 {
+        let line: String = g_lines[g_cy]
+        let p: String = parts[0]
+        g_lines[g_cy] = line.substring(0, g_cx) + p + line.substring(g_cx, line.length())
+        g_cx = g_cx + p.length()
+    } else {
+        let line: String = g_lines[g_cy]
+        let before = line.substring(0, g_cx)
+        let after = line.substring(g_cx, line.length())
+        let first_part: String = parts[0]
+        let last_part: String = parts[parts.length() - 1]
+        g_lines[g_cy] = before + first_part
+        var i = 1
+        while i < parts.length() - 1 {
+            let mid_part: String = parts[i]
+            g_lines.insert(g_cy + i, mid_part)
+            i = i + 1
+        }
+        g_lines.insert(g_cy + parts.length() - 1, last_part + after)
+        g_cy = g_cy + parts.length() - 1
+        g_cx = last_part.length()
+    }
+    g_modified = true
+    op_commit(rec, parts.length(), lines_text(y0, parts.length()))
+    g_message = "Pasted"
+}
+
+// Scroll/clamp helpers
+
+fn clamp_col() {
+    let line: String = g_lines[g_cy]
+    if g_cx > line.length() {
+        g_cx = line.length()
+    }
+    // No aterrizar en medio de un codepoint (p.ej. tras mover entre líneas)
+    while g_cx > 0 and g_cx < line.length() and is_utf8_cont(line.charAt(g_cx)) {
+        g_cx = g_cx - 1
+    }
+}
+
+fn adjust_scroll() {
+    if g_cy < g_top {
+        g_top = g_cy
+    }
+    if g_cy >= g_top + g_rows {
+        g_top = g_cy - g_rows + 1
+    }
+}
+
+// Buffer operations — uses arr.insert/remove builtins
+
+// Inserta texto SIN saltos de línea en el cursor (1 char ASCII o 1 codepoint)
+fn insert_str(s: String) {
+    let line: String = g_lines[g_cy]
+    let rec = op_begin(g_cy, 1, typing_group())
+    g_lines[g_cy] = line.substring(0, g_cx) + s + line.substring(g_cx, line.length())
+    g_cx = g_cx + s.length()
+    g_modified = true
+    op_commit(rec, 1, lines_text(g_cy, 1))
+    g_last_edit_y = g_cy
+    g_last_edit_x = g_cx
+}
+
+fn insert_char(code: int) {
+    insert_str(chr(code))
+}
+
+fn insert_tab() {
+    let line: String = g_lines[g_cy]
+    let rec = op_begin(g_cy, 1, new_group())
+    g_lines[g_cy] = line.substring(0, g_cx) + "    " + line.substring(g_cx, line.length())
+    g_cx = g_cx + TAB_WIDTH
+    g_modified = true
+    op_commit(rec, 1, lines_text(g_cy, 1))
+}
+
+fn insert_newline() {
+    let line: String = g_lines[g_cy]
+    let y0 = g_cy
+    let rec = op_begin(y0, 1, new_group())
+    let before = line.substring(0, g_cx)
+    let after = line.substring(g_cx, line.length())
+    g_lines[g_cy] = before
+    g_lines.insert(g_cy + 1, after)
+    g_cy = g_cy + 1
+    g_cx = 0
+    g_modified = true
+    op_commit(rec, 2, lines_text(y0, 2))
+}
+
+fn delete_char_back() {
+    if g_cx > 0 {
+        let line: String = g_lines[g_cy]
+        let rec = op_begin(g_cy, 1, new_group())
+        let p = utf8_prev(line, g_cx)
+        g_lines[g_cy] = line.substring(0, p) + line.substring(g_cx, line.length())
+        g_cx = p
+        g_modified = true
+        op_commit(rec, 1, lines_text(g_cy, 1))
+    } else if g_cy > 0 {
+        let y0 = g_cy - 1
+        let rec = op_begin(y0, 2, new_group())
+        let prev: String = g_lines[g_cy - 1]
+        let curr: String = g_lines[g_cy]
+        g_cx = prev.length()
+        g_lines[g_cy - 1] = prev + curr
+        g_lines.remove(g_cy)
+        g_cy = g_cy - 1
+        g_modified = true
+        op_commit(rec, 1, lines_text(y0, 1))
+    }
+}
+
+fn delete_char_fwd() {
+    let line: String = g_lines[g_cy]
+    if g_cx < line.length() {
+        let rec = op_begin(g_cy, 1, new_group())
+        let n = utf8_next(line, g_cx)
+        g_lines[g_cy] = line.substring(0, g_cx) + line.substring(n, line.length())
+        g_modified = true
+        op_commit(rec, 1, lines_text(g_cy, 1))
+    } else if g_cy < g_lines.length() - 1 {
+        let rec = op_begin(g_cy, 2, new_group())
+        let next: String = g_lines[g_cy + 1]
+        g_lines[g_cy] = line + next
+        g_lines.remove(g_cy + 1)
+        g_modified = true
+        op_commit(rec, 1, lines_text(g_cy, 1))
+    }
+}
+
+fn delete_line() {
+    let had = g_lines.length()
+    let rec = op_begin(g_cy, 1, new_group())
+    g_lines.remove(g_cy)
+    if g_lines.length() == 0 {
+        g_lines.push("")
+    }
+    if g_cy >= g_lines.length() {
+        g_cy = g_lines.length() - 1
+    }
+    g_cx = 0
+    g_modified = true
+    if had == 1 {
+        op_commit(rec, 1, "")
+    } else {
+        op_commit(rec, 0, "")
+    }
+    g_message = "Line deleted"
+}
+
+// Syntax highlighting — colorize a line for display
+
+fn is_keyword(word: String) -> bool {
+    var i = 0
+    while i < g_keywords.length() {
+        let kw: String = g_keywords[i]
+        if kw == word { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn is_alpha(c: int) -> bool {
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95
+}
+
+fn is_alnum(c: int) -> bool {
+    return is_alpha(c) or (c >= 48 and c <= 57)
+}
+
+fn is_digit(c: int) -> bool {
+    return c >= 48 and c <= 57
+}
+
+// + - * / = < > ! & | % ^  (el / llega acá solo si NO abre comentario)
+fn is_operator_char(c: int) -> bool {
+    return c == 43 or c == 45 or c == 42 or c == 47 or c == 61 or c == 60 or c == 62 or c == 33 or c == 38 or c == 124 or c == 37 or c == 94
+}
+
+fn render_line(line: String, start_col: int, max_w: int) {
+    let len = line.length()
+    var col = 0
+    var i = start_col
+    // State: 0=normal, 1=in_string, 2=in_comment
+    var state = 0
+
+    while i < len and col < max_w {
+        let ch = line.charAt(i)
+
+        if state == 2 {
+            // Inside comment — everything is gray
+            i = emit_char_at(line, i)
+            col = col + 1
+        } else if state == 1 {
+            // Inside string literal
+            if ch == 34 {
+                out(chr(34))
+                col = col + 1
+                i = i + 1
+                attr_off()
+                state = 0
+            } else if ch == 92 and i + 1 < len {
+                out(chr(ch))
+                col = col + 1
+                i = i + 1
+                if i < len and col < max_w {
+                    i = emit_char_at(line, i)
+                    col = col + 1
+                }
+            } else {
+                i = emit_char_at(line, i)
+                col = col + 1
+            }
+        } else {
+            // Normal state
+            // Check for comment start
+            if ch == 47 and i + 1 < len and line.charAt(i + 1) == 47 {
+                fg_color(106, 115, 125)
+                state = 2
+                out(chr(ch))
+                col = col + 1
+                i = i + 1
+            } else if ch == 34 {
+                // String literal start
+                fg_color(206, 145, 120)
+                state = 1
+                out(chr(34))
+                col = col + 1
+                i = i + 1
+            } else if is_alpha(ch) {
+                // Identifier or keyword
+                var word = ""
+                var wi = i
+                while wi < len and is_alnum(line.charAt(wi)) {
+                    word = word + chr(line.charAt(wi))
+                    wi = wi + 1
+                }
+                if is_keyword(word) {
+                    fg_color(86, 156, 214)
+                    out(word)
+                    attr_off()
+                } else if word == "String" or word == "int" or word == "bool" or word == "float" or word == "Array" or word == "Map" or word == "File" {
+                    fg_color(78, 201, 176)
+                    out(word)
+                    attr_off()
+                } else if wi < len and line.charAt(wi) == 40 {
+                    // Llamada a función: identificador pegado a "(" —
+                    // cubre built-ins y funciones del usuario por igual
+                    fg_color(220, 220, 170)
+                    out(word)
+                    attr_off()
+                } else {
+                    out(word)
+                }
+                col = col + word.length()
+                i = wi
+            } else if is_digit(ch) {
+                // Number
+                fg_color(181, 206, 168)
+                while i < len and col < max_w and is_digit(line.charAt(i)) {
+                    out(chr(line.charAt(i)))
+                    col = col + 1
+                    i = i + 1
+                }
+                attr_off()
+            } else if is_operator_char(ch) {
+                fg_color(86, 182, 194)
+                out(chr(ch))
+                attr_off()
+                col = col + 1
+                i = i + 1
+            } else {
+                // Punctuation/other (incluye codepoints UTF-8 enteros)
+                i = emit_char_at(line, i)
+                col = col + 1
+            }
+        }
+    }
+    // Reset any lingering color
+    if state != 0 { attr_off() }
+}
+
+// Check if a position is within the selection
+fn in_selection(x: int, y: int) -> bool {
+    if not g_sel_active { return false }
+    let coords = sel_ordered()
+    let sx: int = coords[0]
+    let sy: int = coords[1]
+    let ex: int = coords[2]
+    let ey: int = coords[3]
+
+    if y < sy or y > ey { return false }
+    if y == sy and y == ey { return x >= sx and x < ex }
+    if y == sy { return x >= sx }
+    if y == ey { return x < ex }
+    return true
+}
+
+// Render
+
+fn render() {
+    if not g_running { return }
+
+    g_frame = []
+    g_buffering = true
+    // Synchronized output (?2026): el terminal aplica el frame atómicamente;
+    // los que no lo soportan ignoran la secuencia sin efectos.
+    esc("[?2026h")
+    hide_cursor()
+    move_to(0, 0)
+
+    let num_lines = g_lines.length()
+    let content_w = g_cols - PREFIX_W
+
+    var screen_row = 0
+    while screen_row < g_rows {
+        let file_row = g_top + screen_row
+
+        if file_row < num_lines {
+            // Line number
+            dim_on()
+            out(line_num_str(file_row + 1) + " | ")
+            attr_off()
+
+            // Content with syntax highlighting
+            let line: String = g_lines[file_row]
+            if g_sel_active {
+                // With selection: render por codepoint chequeando el rango
+                var ci = 0
+                var printed = 0
+                while ci < line.length() and printed < content_w {
+                    let in_sel = in_selection(ci, file_row)
+                    if in_sel { rev_on() }
+                    ci = emit_char_at(line, ci)
+                    if in_sel { attr_off() }
+                    printed = printed + 1
+                }
+            } else {
+                render_line(line, 0, content_w)
+            }
+        } else {
+            dim_on()
+            out("~    | ")
+            attr_off()
+        }
+
+        erase_eol()
+        out("\r\n")
+        screen_row = screen_row + 1
+    }
+
+    // Status bar
+    var mod_mark = ""
+    if g_modified { mod_mark = " [+]" }
+    let cur_ln = g_cy + 1
+    let tot_ln = g_lines.length()
+    let cur_line: String = g_lines[g_cy]
+    let cur_col = col_of(cur_line, g_cx) + 1
+    let status_left = " " + g_filename + mod_mark
+    let status_right = "Ln " + int_to_string(cur_ln) + "/" + int_to_string(tot_ln) + " Col " + int_to_string(cur_col) + " "
+    let gap = g_cols - status_left.length() - status_right.length()
+    var status_mid = ""
+    var si = 0
+    while si < gap {
+        status_mid = status_mid + " "
+        si = si + 1
+    }
+    rev_on()
+    out(pad_right(status_left + status_mid + status_right, g_cols))
+    attr_off()
+    out("\r\n")
+
+    // Message bar
+    out(pad_right(g_message, g_cols))
+
+    // Position cursor (columna VISUAL, no índice de byte)
+    let view_row = g_cy - g_top
+    let view_col = col_of(cur_line, g_cx) + PREFIX_W
+    move_to(view_row, view_col)
+    show_cursor()
+    esc("[?2026l")
+    g_buffering = false
+    frame_flush()
+}
+
+// Search
+
+fn prompt_input(prompt_text: String) -> String {
+    move_to(g_rows + 1, 0)
+    attr_off()
+    out(pad_right(prompt_text, g_cols))
+    move_to(g_rows + 1, prompt_text.length())
+    show_cursor()
+
+    var input = ""
+    var done = false
+    while not done {
+        let k = read_byte()
+        if k == 13 or k == 10 {
+            done = true
+        } else if k == 27 {
+            return ""
+        } else if k == 127 or k == 8 {
+            if input.length() > 0 {
+                input = input.substring(0, utf8_prev(input, input.length()))
+                move_to(g_rows + 1, 0)
+                out(pad_right(prompt_text + input, g_cols))
+                move_to(g_rows + 1, prompt_text.length() + col_of(input, input.length()))
+            }
+        } else if k >= 32 and k <= 126 {
+            input = input + chr(k)
+            out(chr(k))
+        } else if k >= 128 {
+            // byte UTF-8 crudo: acumular y re-pintar la línea del prompt
+            input = input + chr(k)
+            move_to(g_rows + 1, 0)
+            out(pad_right(prompt_text + input, g_cols))
+            move_to(g_rows + 1, prompt_text.length() + col_of(input, input.length()))
+        }
+    }
+    return input
+}
+
+fn do_search() {
+    let term = prompt_input("Search: ")
+    if term == "" {
+        g_message = "Search cancelled"
+        return
+    }
+    g_search_term = term
+    search_next()
+}
+
+fn search_next() {
+    if g_search_term == "" {
+        g_message = "No search term"
+        return
+    }
+    // Search from current position forward
+    var y = g_cy
+    var started = false
+    while y < g_lines.length() {
+        let line: String = g_lines[y]
+        var start_x = 0
+        if not started { start_x = g_cx + 1 }
+        started = true
+        if start_x < line.length() {
+            let rest = line.substring(start_x, line.length())
+            let idx = rest.indexOf(g_search_term)
+            if idx >= 0 {
+                g_cy = y
+                g_cx = start_x + idx
+                adjust_scroll()
+                g_message = "Found: " + g_search_term
+                return
+            }
+        }
+        y = y + 1
+    }
+    // Wrap around from beginning
+    y = 0
+    while y <= g_cy {
+        let line: String = g_lines[y]
+        let idx = line.indexOf(g_search_term)
+        if idx >= 0 {
+            g_cy = y
+            g_cx = idx
+            adjust_scroll()
+            g_message = "Found (wrapped): " + g_search_term
+            return
+        }
+        y = y + 1
+    }
+    g_message = "Not found: " + g_search_term
+}
+
+fn do_goto_line() {
+    let input = prompt_input("Go to line: ")
+    if input == "" { return }
+    let target = string_to_int(input) - 1
+    if target >= 0 and target < g_lines.length() {
+        g_cy = target
+        g_cx = 0
+        adjust_scroll()
+        g_message = "Jumped to line " + input
+    } else {
+        g_message = "Invalid line number"
+    }
+}
+
+// Process key
+
+fn process_key(key: int) {
+    if key == -1 { return }
+
+    // Ctrl+Q — quit
+    if key == CTRL_Q {
+        g_running = false
+        return
+    }
+
+    // Ctrl+S — save
+    if key == CTRL_S {
+        save_file()
+        return
+    }
+
+    // Ctrl+Z — undo
+    if key == CTRL_Z {
+        do_undo()
+        return
+    }
+
+    // Ctrl+Y — redo
+    if key == CTRL_Y {
+        do_redo()
+        return
+    }
+
+    // Ctrl+F — search
+    if key == CTRL_F {
+        do_search()
+        return
+    }
+
+    // Ctrl+G — goto line
+    if key == CTRL_G {
+        do_goto_line()
+        return
+    }
+
+    // Ctrl+C — copy
+    if key == CTRL_C {
+        do_copy()
+        return
+    }
+
+    // Ctrl+X — cut
+    if key == CTRL_X {
+        do_cut()
+        return
+    }
+
+    // Ctrl+V — paste
+    if key == CTRL_V {
+        do_paste()
+        return
+    }
+
+    // Ctrl+K — delete line
+    if key == CTRL_K {
+        delete_line()
+        return
+    }
+
+    // Selection with shift+arrows
+    if key == KEY_SHIFT_UP {
+        sel_start_at(g_cx, g_cy)
+        if g_cy > 0 {
+            g_cy = g_cy - 1
+            clamp_col()
+        }
+        adjust_scroll()
+        return
+    }
+    if key == KEY_SHIFT_DOWN {
+        sel_start_at(g_cx, g_cy)
+        if g_cy < g_lines.length() - 1 {
+            g_cy = g_cy + 1
+            clamp_col()
+        }
+        adjust_scroll()
+        return
+    }
+    if key == KEY_SHIFT_LEFT {
+        sel_start_at(g_cx, g_cy)
+        if g_cx > 0 {
+            let line: String = g_lines[g_cy]
+            g_cx = utf8_prev(line, g_cx)
+        } else if g_cy > 0 {
+            g_cy = g_cy - 1
+            let prev: String = g_lines[g_cy]
+            g_cx = prev.length()
+        }
+        adjust_scroll()
+        return
+    }
+    if key == KEY_SHIFT_RIGHT {
+        sel_start_at(g_cx, g_cy)
+        let line: String = g_lines[g_cy]
+        if g_cx < line.length() {
+            g_cx = utf8_next(line, g_cx)
+        } else if g_cy < g_lines.length() - 1 {
+            g_cy = g_cy + 1
+            g_cx = 0
+        }
+        adjust_scroll()
+        return
+    }
+
+    // Non-shift movement clears selection
+    if key == KEY_UP or key == KEY_DOWN or key == KEY_LEFT or key == KEY_RIGHT or key == KEY_HOME or key == KEY_END or key == KEY_PGUP or key == KEY_PGDN {
+        sel_clear()
+    }
+
+    // Movement
+    if key == KEY_UP {
+        if g_cy > 0 {
+            g_cy = g_cy - 1
+            clamp_col()
+        }
+        adjust_scroll()
+        return
+    }
+    if key == KEY_DOWN {
+        if g_cy < g_lines.length() - 1 {
+            g_cy = g_cy + 1
+            clamp_col()
+        }
+        adjust_scroll()
+        return
+    }
+    if key == KEY_LEFT {
+        if g_cx > 0 {
+            let line: String = g_lines[g_cy]
+            g_cx = utf8_prev(line, g_cx)
+        } else if g_cy > 0 {
+            g_cy = g_cy - 1
+            let prev: String = g_lines[g_cy]
+            g_cx = prev.length()
+        }
+        adjust_scroll()
+        return
+    }
+    if key == KEY_RIGHT {
+        let line: String = g_lines[g_cy]
+        if g_cx < line.length() {
+            g_cx = utf8_next(line, g_cx)
+        } else if g_cy < g_lines.length() - 1 {
+            g_cy = g_cy + 1
+            g_cx = 0
+        }
+        adjust_scroll()
+        return
+    }
+    if key == KEY_HOME {
+        g_cx = 0
+        return
+    }
+    if key == KEY_END {
+        let line: String = g_lines[g_cy]
+        g_cx = line.length()
+        return
+    }
+    if key == KEY_PGUP {
+        if g_cy > g_rows {
+            g_cy = g_cy - g_rows
+        } else {
+            g_cy = 0
+        }
+        clamp_col()
+        adjust_scroll()
+        return
+    }
+    if key == KEY_PGDN {
+        g_cy = g_cy + g_rows
+        if g_cy >= g_lines.length() {
+            g_cy = g_lines.length() - 1
+        }
+        clamp_col()
+        adjust_scroll()
+        return
+    }
+
+    // Editing
+    if key == KEY_DEL {
+        if g_sel_active {
+            delete_selection()
+        } else {
+            delete_char_fwd()
+        }
+        return
+    }
+
+    if key == 127 or key == 8 {
+        if g_sel_active {
+            delete_selection()
+        } else {
+            delete_char_back()
+        }
+        return
+    }
+
+    if key == 13 or key == 10 {
+        if g_sel_active { delete_selection() }
+        insert_newline()
+        adjust_scroll()
+        return
+    }
+
+    if key == 9 {
+        if g_sel_active { delete_selection() }
+        insert_tab()
+        return
+    }
+
+    // Printable character
+    if key >= 32 and key <= 126 {
+        if g_sel_active { delete_selection() }
+        insert_char(key)
+        g_message = "Ctrl+S save  Ctrl+Q quit  Ctrl+F search  Ctrl+Z undo  Ctrl+Y redo"
+        return
+    }
+
+    // Evento de mouse SGR
+    if key == KEY_MOUSE {
+        handle_mouse()
+        return
+    }
+
+    // Bracketed paste completo capturado por read_key
+    if key == KEY_PASTE {
+        do_paste_text(g_paste_buf)
+        g_paste_buf = ""
+        return
+    }
+
+    // Codepoint UTF-8 multibyte armado por read_key
+    if key == KEY_UTF8 {
+        if g_sel_active { delete_selection() }
+        insert_str(g_utf8_buf)
+        g_message = "Ctrl+S save  Ctrl+Q quit  Ctrl+F search  Ctrl+Z undo  Ctrl+Y redo"
+        return
+    }
+}
+
+// Mouse
+
+// Coloca el cursor donde cayó el click (solo dentro del área de texto)
+fn mouse_set_cursor() {
+    if g_mouse_y - 1 >= g_rows { return }
+    var row = g_top + g_mouse_y - 1
+    if row < 0 { row = 0 }
+    if row >= g_lines.length() { row = g_lines.length() - 1 }
+    g_cy = row
+    let line: String = g_lines[g_cy]
+    var scol = g_mouse_x - 1 - PREFIX_W
+    if scol < 0 { scol = 0 }
+    g_cx = byte_of_col(line, scol)
+    adjust_scroll()
+}
+
+fn handle_mouse() {
+    // Rueda: scroll de a 3 líneas moviendo el cursor
+    if g_mouse_b == 64 {
+        var n = 0
+        while n < 3 {
+            if g_cy > 0 { g_cy = g_cy - 1 }
+            n = n + 1
+        }
+        clamp_col()
+        adjust_scroll()
+        return
+    }
+    if g_mouse_b == 65 {
+        var n = 0
+        while n < 3 {
+            if g_cy < g_lines.length() - 1 { g_cy = g_cy + 1 }
+            n = n + 1
+        }
+        clamp_col()
+        adjust_scroll()
+        return
+    }
+    // Click izquierdo: posicionar cursor
+    if g_mouse_b == 0 and g_mouse_press {
+        sel_clear()
+        mouse_set_cursor()
+        return
+    }
+    // Drag con botón izquierdo (b=32): extender selección desde el press
+    if g_mouse_b == 32 {
+        sel_start_at(g_cx, g_cy)
+        mouse_set_cursor()
+        return
+    }
+}
+
+// Signal handlers
+
+fn on_winch(sig: int) {
+    // SOLO un store: corremos en contexto de señal (ver g_resize_pending).
+    g_resize_pending = true
+}
+
+fn apply_resize() {
+    g_resize_pending = false
+    g_cols = term_cols()
+    g_rows = term_rows() - 2
+    if g_rows < 1 { g_rows = 1 }
+    clamp_col()
+    adjust_scroll()
+    // Al achicar, el contenido viejo fuera del área nueva queda huérfano:
+    // limpiar todo antes del próximo frame.
+    clear_screen()
+}
+
+fn sigint_cleanup(sig: int) {
+    mouse_mode_off()
+    paste_mode_off()
+    leave_alt_screen()
+    show_cursor()
+    raw_mode_exit()
+    exit(0)
+}
+
+// Main
+
+fn main() -> int {
+    let args = get_args()
+    if args.length() > 1 {
+        let fname: String = args[1]
+        g_filename = fname
+    }
+
+    g_lines = load_file(g_filename)
+
+    // Detect terminal size using builtins
+    g_cols = term_cols()
+    g_rows = term_rows() - 2
+
+    signal_handle(2, sigint_cleanup)
+    signal_handle(28, on_winch)
+
+    raw_mode_enter()
+    enter_alt_screen()
+    paste_mode_on()
+    mouse_mode_on()
+    // Red de seguridad para cualquier path de salida (el destructor C del
+    // runtime solo restaura termios — alt screen, paste mode, mouse y cursor
+    // son responsabilidad del editor).
+    defer {
+        mouse_mode_off()
+        paste_mode_off()
+        leave_alt_screen()
+        show_cursor()
+        raw_mode_exit()
+    }
+    clear_screen()
+
+    while g_running {
+        if g_resize_pending { apply_resize() }
+        render()
+        let key = read_key()
+        if key != KEY_NONE {
+            process_key(key)
+        }
+    }
+
+    // Salir del alt screen ANTES de imprimir, para que el mensaje quede en la
+    // pantalla normal (el defer re-emite las secuencias: inofensivo).
+    mouse_mode_off()
+    paste_mode_off()
+    leave_alt_screen()
+    show_cursor()
+    print("nyx-edit — bye!")
+    return 0
+}
