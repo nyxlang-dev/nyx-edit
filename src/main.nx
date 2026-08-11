@@ -1562,7 +1562,11 @@ fn handle_mouse() {
 // Signal handlers
 
 fn on_winch(sig: int) {
-    // SOLO un store: corremos en contexto de señal (ver g_resize_pending).
+    // Desde nyx v0.24.32 (self-pipe) este handler corre en el thread
+    // drenador del runtime (contexto normal — podría alocar). El store
+    // sigue alcanzando: el main loop además re-mide ante CUALQUIER
+    // despertar por señal (ver el else de KEY_NONE), porque la entrega es
+    // asíncrona y este flag puede llegar DESPUÉS del EINTR del poll.
     g_resize_pending = true
 }
 
@@ -1627,6 +1631,13 @@ fn main() -> int {
         let key = read_key()
         if key != KEY_NONE {
             process_key(key)
+        } else {
+            // KEY_NONE = despertar por señal (poll EINTR, sin tecla). Desde
+            // nyx v0.24.32 el handler de SIGWINCH corre ASÍNCRONO en el
+            // thread drenador: el EINTR puede llegar ANTES del flag. Re-medir
+            // acá incondicional (ioctl barato, idempotente) mata la carrera —
+            // el render del próximo loop ya usa el ancho nuevo.
+            apply_resize()
         }
     }
 
