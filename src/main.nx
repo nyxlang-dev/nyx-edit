@@ -303,8 +303,14 @@ fn max(a: int, b: int) -> int {
 // Input
 
 fn read_key() -> int {
-    // poll() sin timeout: despierta ante SIGWINCH (-2) aunque no haya tecla.
-    let c = read_byte_timeout(0 - 1)
+    // Espera ACOTADA, no infinita. El poll despierta con EINTR ante SIGWINCH
+    // (-2), pero solo si la señal llega mientras estamos DENTRO del poll: si
+    // llegó un instante antes —durante el render, o entre el chequeo del flag
+    // y este read— el EINTR ya se gastó y una espera infinita no se entera
+    // nunca. Con el tope, el peor caso es medio segundo de retraso en el
+    // re-render en vez de un bloqueo permanente. Un despertar cada 500 ms con
+    // el editor ocioso es ruido despreciable; el bloqueo no lo era.
+    let c = read_byte_timeout(500)
     if c == -2 { return KEY_NONE }
     if c == -1 { return -1 }
 
@@ -1628,16 +1634,37 @@ fn main() -> int {
     while g_running {
         if g_resize_pending { apply_resize() }
         render()
+        // La señal puede haber llegado DURANTE render(), no durante el poll.
+        // En ese caso el EINTR ya se gastó contra el write del render y el
+        // read_key() de abajo bloquearía sin nada que lo despierte: el flag
+        // solo se mira arriba del bucle, y para volver arriba hay que salir de
+        // ese read. Medido el 2026-09-11: era el 50% de las corridas del test
+        // de resize —no azar, una carrera— y con 30 s de margen tampoco
+        // re-renderizaba, porque no era lentitud sino un bloqueo definitivo.
+        // Chequear acá cierra la ventana grande; el timeout de read_key cierra
+        // la chica (entre este if y la entrada al poll).
+        if g_resize_pending {
+            continue
+        }
         let key = read_key()
         if key != KEY_NONE {
             process_key(key)
         } else {
-            // KEY_NONE = despertar por señal (poll EINTR, sin tecla). Desde
-            // nyx v0.24.32 el handler de SIGWINCH corre ASÍNCRONO en el
-            // thread drenador: el EINTR puede llegar ANTES del flag. Re-medir
-            // acá incondicional (ioctl barato, idempotente) mata la carrera —
-            // el render del próximo loop ya usa el ancho nuevo.
-            apply_resize()
+            // KEY_NONE = despertar SIN tecla: o EINTR de una señal, o el
+            // vencimiento del timeout de read_key. `read_byte_timeout`
+            // devuelve -2 para los dos casos (runtime.c), así que acá no se
+            // pueden distinguir — ni hace falta.
+            //
+            // Re-medir el terminal y comparar es barato (un ioctl) y, a
+            // diferencia de llamar a apply_resize() directo, NO parpadea:
+            // apply_resize hace clear_screen(), y con el timeout de 500 ms
+            // esto corre dos veces por segundo con el editor ocioso. Solo se
+            // aplica el resize si el tamaño REALMENTE cambió.
+            let cols_ahora: int = term_cols()
+            let rows_ahora: int = term_rows() - 2
+            if cols_ahora != g_cols or rows_ahora != g_rows {
+                apply_resize()
+            }
         }
     }
 
