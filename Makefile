@@ -2,7 +2,7 @@
 # El toolchain Nyx (compilador, runtime, std) vive fuera de este repo.
 # Se apunta vía NYX_HOME (patrón nyx-kv-stack).
 
-NYX_HOME ?= /home/admin/nyx/lang
+NYX_HOME ?= /home/admin/nyxlang
 export NYX_HOME
 
 .PHONY: build test-edit install uninstall clean
